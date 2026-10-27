@@ -18,6 +18,10 @@
 
 #include <mach/ppmu.h>
 
+#include <linux/workqueue.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
 #define MAX_LOAD		100
 #define LOAD_HISTORY_SIZE	5
 #define DIVIDING_FACTOR		10000
