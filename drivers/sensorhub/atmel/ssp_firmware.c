@@ -471,7 +471,7 @@ int check_fwbl(struct ssp_data *data)
 				data->uCurFirmRev == ERROR) {
 				pr_err("[SSP] MCU is not working\n");
 				return FW_DL_STATE_FAIL;
-			} else if (data->uCurFirmRev != SSP_FIRMWARE_REVISION) {
+			} else if (data->uCurFirmRev < SSP_FIRMWARE_REVISION) {
 				pr_info("[SSP] MCU Firm Rev : Old = %8u, New = "
 					"%8u\n", data->uCurFirmRev,
 					SSP_FIRMWARE_REVISION);
