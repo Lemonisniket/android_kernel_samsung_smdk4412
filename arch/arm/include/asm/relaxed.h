@@ -16,5 +16,24 @@
 #define _ASM_RELAXED_H_
 
 #include <asm-generic/relaxed.h>
+#include <linux/compiler.h>
 
-#endif /*_ASM_RELAXED_H_*/
+#ifndef cpu_read_relax
+#if defined(__LINUX_ARM_ARCH__) && __LINUX_ARM_ARCH__ >= 7
+static inline void cpu_read_relax(void)
+{
+	asm volatile("wfe" : : : "memory");
+}
+#else
+static inline void cpu_read_relax(void)
+{
+	barrier();
+}
+#endif
+#endif
+
+#ifndef cpu_relax
+#define cpu_relax() cpu_read_relax()
+#endif
+
+#endif /* _ASM_RELAXED_H_ */

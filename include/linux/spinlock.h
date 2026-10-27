@@ -55,6 +55,7 @@
 #include <linux/kernel.h>
 #include <linux/stringify.h>
 #include <linux/bottom_half.h>
+#include <linux/bug.h>
 
 #include <asm/system.h>
 

@@ -148,11 +148,8 @@ int mali_stream_create_fence(mali_sync_pt *pt)
 	spin_lock(&files->file_lock);
 	fdt = files_fdtable(files);
 	__set_close_on_exec(fd, fdt);
-#else
-	FD_SET(fd, fdt->close_on_exec);
-#endif
 	spin_unlock(&files->file_lock);
-#endif /* Linux >= 3.6 */
+#endif
 
 	/* bind fence to the new fd */
 	sync_fence_install(fence, fd);
