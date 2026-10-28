@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2014 Sergey Senozhatsky.
+ * Updated for LZ4 v1.7.5 by Sven Schmidt / backport.
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -10,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/lz4.h>
+#include <linux/mm.h>
 
 #include "zcomp_lz4.h"
 
@@ -26,16 +28,24 @@ static void zcomp_lz4_destroy(void *private)
 static int zcomp_lz4_compress(const unsigned char *src, unsigned char *dst,
 		size_t *dst_len, void *private)
 {
-	/* return  : Success if return 0 */
-	return lz4_compress(src, PAGE_SIZE, dst, dst_len, private);
+	int ret;
+
+	ret = LZ4_compress_default(src, dst, PAGE_SIZE, *dst_len, private);
+	if (!ret)
+		return -EINVAL;
+	*dst_len = ret;
+	return 0;
 }
 
 static int zcomp_lz4_decompress(const unsigned char *src, size_t src_len,
 		unsigned char *dst)
 {
-	size_t dst_len = PAGE_SIZE;
-	/* return  : Success if return 0 */
-	return lz4_decompress_unknownoutputsize(src, src_len, dst, &dst_len);
+	int ret;
+
+	ret = LZ4_decompress_safe(src, dst, src_len, PAGE_SIZE);
+	if (ret < 0)
+		return -EINVAL;
+	return 0;
 }
 
 struct zcomp_backend zcomp_lz4 = {
