@@ -105,6 +105,16 @@ static inline void prandom_seed_state(struct rnd_state *state, u64 seed)
 	state->s3 = __seed(i, 15);
 }
 
+static inline u32 random32(void)
+{
+	return prandom_u32();
+}
+
+static inline void srandom32(u32 seed)
+{
+	prandom_seed(seed);
+}
+
 #ifdef CONFIG_ARCH_RANDOM
 # include <asm/archrandom.h>
 #else
@@ -116,6 +126,10 @@ static inline int arch_get_random_int(unsigned int *v)
 {
 	return 0;
 }
+#endif
+
+#ifndef srandom32
+#define srandom32(seed) prandom_seed(seed)
 #endif
 
 #endif /* __KERNEL___ */

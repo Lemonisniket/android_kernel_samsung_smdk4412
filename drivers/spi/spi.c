@@ -29,6 +29,7 @@
 #include <linux/spi/spi.h>
 #include <linux/of_spi.h>
 #include <linux/pm_runtime.h>
+#include <linux/delay.h>
 
 static void spidev_release(struct device *dev)
 {
@@ -506,6 +507,294 @@ spi_register_board_info(struct spi_board_info const *info, unsigned n)
 
 /*-------------------------------------------------------------------------*/
 
+/**
+ * spi_pump_messages - kthread work function which processes spi message queue
+ * @work: pointer to kthread work struct contained in the master struct
+ *
+ * This function checks if there is any spi message in the queue that
+ * needs processing and if so call out to the driver to initialize hardware
+ * and transfer each message.
+ *
+ */
+static void spi_pump_messages(struct kthread_work *work)
+{
+	struct spi_master *master =
+		container_of(work, struct spi_master, pump_messages);
+	unsigned long flags;
+	bool was_busy = false;
+	int ret;
+
+	/* Lock queue and check for queue work */
+	spin_lock_irqsave(&master->queue_lock, flags);
+	if (list_empty(&master->queue) || !master->running) {
+		if (master->busy) {
+			ret = master->unprepare_transfer_hardware(master);
+			if (ret) {
+				spin_unlock_irqrestore(&master->queue_lock, flags);
+				dev_err(&master->dev,
+					"failed to unprepare transfer hardware\n");
+				return;
+			}
+		}
+		master->busy = false;
+		spin_unlock_irqrestore(&master->queue_lock, flags);
+		return;
+	}
+
+	/* Make sure we are not already running a message */
+	if (master->cur_msg) {
+		spin_unlock_irqrestore(&master->queue_lock, flags);
+		return;
+	}
+	/* Extract head of queue */
+	master->cur_msg =
+	    list_entry(master->queue.next, struct spi_message, queue);
+
+	list_del_init(&master->cur_msg->queue);
+	if (master->busy)
+		was_busy = true;
+	else
+		master->busy = true;
+	spin_unlock_irqrestore(&master->queue_lock, flags);
+
+	if (!was_busy) {
+		ret = master->prepare_transfer_hardware(master);
+		if (ret) {
+			dev_err(&master->dev,
+				"failed to prepare transfer hardware\n");
+			return;
+		}
+	}
+
+	ret = master->transfer_one_message(master, master->cur_msg);
+	if (ret) {
+		dev_err(&master->dev,
+			"failed to transfer one message from queue\n");
+		return;
+	}
+}
+
+static int spi_init_queue(struct spi_master *master)
+{
+	struct sched_param param = { .sched_priority = MAX_RT_PRIO - 1 };
+
+	INIT_LIST_HEAD(&master->queue);
+	spin_lock_init(&master->queue_lock);
+
+	master->running = false;
+	master->busy = false;
+
+	init_kthread_worker(&master->kworker);
+	master->kworker_task = kthread_run(kthread_worker_fn,
+					   &master->kworker,
+					   dev_name(&master->dev));
+	if (IS_ERR(master->kworker_task)) {
+		dev_err(&master->dev, "failed to create message pump task\n");
+		return -ENOMEM;
+	}
+	init_kthread_work(&master->pump_messages, spi_pump_messages);
+
+	/*
+	 * Master config will indicate if this controller should run the
+	 * message pump with high (realtime) priority to reduce the transfer
+	 * latency on the bus by minimising the delay between a transfer
+	 * request and the scheduling of the message pump thread. Without this
+	 * setting the message pump thread will remain at default priority.
+	 */
+	if (master->rt) {
+		dev_info(&master->dev,
+			"will run message pump with realtime priority\n");
+		sched_setscheduler(master->kworker_task, SCHED_FIFO, &param);
+	}
+
+	return 0;
+}
+
+/**
+ * spi_get_next_queued_message() - called by driver to check for queued
+ * messages
+ * @master: the master to check for queued messages
+ *
+ * If there are more messages in the queue, the next message is returned from
+ * this call.
+ */
+struct spi_message *spi_get_next_queued_message(struct spi_master *master)
+{
+	struct spi_message *next;
+	unsigned long flags;
+
+	/* get a pointer to the next message, if any */
+	spin_lock_irqsave(&master->queue_lock, flags);
+	if (list_empty(&master->queue))
+		next = NULL;
+	else
+		next = list_entry(master->queue.next,
+				  struct spi_message, queue);
+	spin_unlock_irqrestore(&master->queue_lock, flags);
+
+	return next;
+}
+EXPORT_SYMBOL_GPL(spi_get_next_queued_message);
+
+/**
+ * spi_finalize_current_message() - the current message is complete
+ * @master: the master to return the message to
+ *
+ * Called by the driver to notify the core that the message in the front of the
+ * queue is complete and can be removed from the queue.
+ */
+void spi_finalize_current_message(struct spi_master *master)
+{
+	struct spi_message *mesg;
+	unsigned long flags;
+
+	spin_lock_irqsave(&master->queue_lock, flags);
+	mesg = master->cur_msg;
+	master->cur_msg = NULL;
+
+	queue_kthread_work(&master->kworker, &master->pump_messages);
+	spin_unlock_irqrestore(&master->queue_lock, flags);
+
+	mesg->state = NULL;
+	if (mesg->complete)
+		mesg->complete(mesg->context);
+}
+EXPORT_SYMBOL_GPL(spi_finalize_current_message);
+
+static int spi_start_queue(struct spi_master *master)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&master->queue_lock, flags);
+
+	if (master->running || master->busy) {
+		spin_unlock_irqrestore(&master->queue_lock, flags);
+		return -EBUSY;
+	}
+
+	master->running = true;
+	master->cur_msg = NULL;
+	spin_unlock_irqrestore(&master->queue_lock, flags);
+
+	queue_kthread_work(&master->kworker, &master->pump_messages);
+
+	return 0;
+}
+
+static int spi_stop_queue(struct spi_master *master)
+{
+	unsigned long flags;
+	unsigned limit = 500;
+	int ret = 0;
+
+	spin_lock_irqsave(&master->queue_lock, flags);
+
+	/*
+	 * This is a bit lame, but is optimized for the common execution path.
+	 * A wait_queue on the master->busy could be used, but then the common
+	 * execution path (pump_messages) would be required to call wake_up or
+	 * friends on every SPI message. Do this instead.
+	 */
+	while ((!list_empty(&master->queue) || master->busy) && limit--) {
+		spin_unlock_irqrestore(&master->queue_lock, flags);
+		msleep(10);
+		spin_lock_irqsave(&master->queue_lock, flags);
+	}
+
+	if (!list_empty(&master->queue) || master->busy)
+		ret = -EBUSY;
+	else
+		master->running = false;
+
+	spin_unlock_irqrestore(&master->queue_lock, flags);
+
+	if (ret) {
+		dev_warn(&master->dev,
+			 "could not stop message queue\n");
+		return ret;
+	}
+	return ret;
+}
+
+static int spi_destroy_queue(struct spi_master *master)
+{
+	int ret;
+
+	ret = spi_stop_queue(master);
+
+	/*
+	 * flush_kthread_worker will block until all work is done.
+	 * If the reason that stop_queue timed out is that the work will never
+	 * finish, then it does no good to call flush/stop thread, so
+	 * return anyway.
+	 */
+	if (ret) {
+		dev_err(&master->dev, "problem destroying queue\n");
+		return ret;
+	}
+
+	flush_kthread_worker(&master->kworker);
+	kthread_stop(master->kworker_task);
+
+	return 0;
+}
+
+/**
+ * spi_queued_transfer - transfer function for queued transfers
+ * @spi: spi device which is requesting transfer
+ * @msg: spi message which is to handled is queued to driver queue
+ */
+static int spi_queued_transfer(struct spi_device *spi, struct spi_message *msg)
+{
+	struct spi_master *master = spi->master;
+	unsigned long flags;
+
+	spin_lock_irqsave(&master->queue_lock, flags);
+
+	if (!master->running) {
+		spin_unlock_irqrestore(&master->queue_lock, flags);
+		return -ESHUTDOWN;
+	}
+	msg->actual_length = 0;
+	msg->status = -EINPROGRESS;
+
+	list_add_tail(&msg->queue, &master->queue);
+	if (master->running && !master->busy)
+		queue_kthread_work(&master->kworker, &master->pump_messages);
+
+	spin_unlock_irqrestore(&master->queue_lock, flags);
+	return 0;
+}
+
+static int spi_master_initialize_queue(struct spi_master *master)
+{
+	int ret;
+
+	master->queued = true;
+	master->transfer = spi_queued_transfer;
+
+	/* Initialize and start queue */
+	ret = spi_init_queue(master);
+	if (ret) {
+		dev_err(&master->dev, "problem initializing queue\n");
+		goto err_init_queue;
+	}
+	ret = spi_start_queue(master);
+	if (ret) {
+		dev_err(&master->dev, "problem starting queue\n");
+		goto err_start_queue;
+	}
+
+	return 0;
+
+err_start_queue:
+err_init_queue:
+	spi_destroy_queue(master);
+	return ret;
+}
+
+/*-------------------------------------------------------------------------*/
+
 static void spi_master_release(struct device *dev)
 {
 	struct spi_master *master;
@@ -553,7 +842,7 @@ struct spi_master *spi_alloc_master(struct device *dev, unsigned size)
 
 	device_initialize(&master->dev);
 	master->dev.class = &spi_master_class;
-	master->dev.parent = get_device(dev);
+	master->dev.parent = dev;
 	spi_master_set_devdata(master, &master[1]);
 
 	return master;
