@@ -156,7 +156,7 @@ EXPORT_SYMBOL_GPL(wakeup_source_add);
  */
 void wakeup_source_remove(struct wakeup_source *ws)
 {
-	if (WARN_ON(!ws))
+	if (!ws)
 		return;
 
 	spin_lock_irq(&events_lock);
